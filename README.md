@@ -1,4 +1,5 @@
 # Rebar-friendly fork of Rabbit common
+[![Build Status](https://secure.travis-ci.org/bkearns/rabbit_common.png)](http://travis-ci.org/bkearns/rabbit_common)
 
 This is a fork of the rabbit_common dependency, which is needed by the 
 [official RabbitMQ/AMQP Erlang client](https://github.com/rabbitmq/rabbitmq-erlang-client). 
