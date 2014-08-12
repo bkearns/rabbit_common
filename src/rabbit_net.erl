@@ -10,17 +10,17 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2007-2012 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2014 GoPivotal, Inc.  All rights reserved.
 %%
 
 -module(rabbit_net).
 -include("rabbit.hrl").
 
 -export([is_ssl/1, ssl_info/1, controlling_process/2, getstat/2,
-         recv/1, async_recv/3, port_command/2, getopts/2, setopts/2, send/2,
-         close/1, fast_close/1, sockname/1, peername/1, peercert/1,
-         tune_buffer_size/1, connection_string/2, socket_ends/2]).
+         recv/1, sync_recv/2, async_recv/3, port_command/2, getopts/2,
+         setopts/2, send/2, close/1, fast_close/1, sockname/1, peername/1,
+         peercert/1, connection_string/2, socket_ends/2, is_loopback/1]).
 
 %%---------------------------------------------------------------------------
 
@@ -48,6 +48,8 @@
 -spec(recv/1 :: (socket()) ->
                      {'data', [char()] | binary()} | 'closed' |
                      rabbit_types:error(any()) | {'other', any()}).
+-spec(sync_recv/2 :: (socket(), integer()) -> rabbit_types:ok(binary()) |
+                                              rabbit_types:error(any())).
 -spec(async_recv/3 ::
         (socket(), integer(), timeout()) -> rabbit_types:ok(any())).
 -spec(port_command/2 :: (socket(), iolist()) -> 'true').
@@ -69,13 +71,13 @@
 -spec(peercert/1 ::
         (socket())
         -> 'nossl' | ok_val_or_error(rabbit_ssl:certificate())).
--spec(tune_buffer_size/1 :: (socket()) -> ok_or_any_error()).
 -spec(connection_string/2 ::
         (socket(), 'inbound' | 'outbound') -> ok_val_or_error(string())).
 -spec(socket_ends/2 ::
         (socket(), 'inbound' | 'outbound')
         -> ok_val_or_error({host_or_ip(), rabbit_networking:ip_port(),
                             host_or_ip(), rabbit_networking:ip_port()})).
+-spec(is_loopback/1 :: (socket() | inet:ip_address()) -> boolean()).
 
 -endif.
 
@@ -114,6 +116,11 @@ recv(S, {DataTag, ClosedTag, ErrorTag}) ->
         {ErrorTag, S, Reason} -> {error, Reason};
         Other                 -> {other, Other}
     end.
+
+sync_recv(Sock, Length) when ?IS_SSL(Sock) ->
+    ssl:recv(Sock#ssl_socket.ssl, Length);
+sync_recv(Sock, Length) ->
+    gen_tcp:recv(Sock, Length).
 
 async_recv(Sock, Length, Timeout) when ?IS_SSL(Sock) ->
     Pid = self(),
@@ -189,13 +196,6 @@ peername(Sock)   when is_port(Sock) -> inet:peername(Sock).
 peercert(Sock)   when ?IS_SSL(Sock) -> ssl:peercert(Sock#ssl_socket.ssl);
 peercert(Sock)   when is_port(Sock) -> nossl.
 
-tune_buffer_size(Sock) ->
-    case getopts(Sock, [sndbuf, recbuf, buffer]) of
-        {ok, BufSizes} -> BufSz = lists:max([Sz || {_Opt, Sz} <- BufSizes]),
-                          setopts(Sock, [{buffer, BufSz}]);
-        Err            -> Err
-    end.
-
 connection_string(Sock, Direction) ->
     case socket_ends(Sock, Direction) of
         {ok, {FromAddress, FromPort, ToAddress, ToPort}} ->
@@ -223,11 +223,24 @@ maybe_ntoab(Addr) when is_tuple(Addr) -> rabbit_misc:ntoab(Addr);
 maybe_ntoab(Host)                     -> Host.
 
 rdns(Addr) ->
-    {ok, Lookup} = application:get_env(rabbit, reverse_dns_lookups),
-    case Lookup of
-        true -> list_to_binary(rabbit_networking:tcp_host(Addr));
-        _    -> Addr
+    case application:get_env(rabbit, reverse_dns_lookups) of
+        {ok, true} -> list_to_binary(rabbit_networking:tcp_host(Addr));
+        _          -> Addr
     end.
 
 sock_funs(inbound)  -> {fun peername/1, fun sockname/1};
 sock_funs(outbound) -> {fun sockname/1, fun peername/1}.
+
+is_loopback(Sock) when is_port(Sock) ; ?IS_SSL(Sock) ->
+    case sockname(Sock) of
+        {ok, {Addr, _Port}} -> is_loopback(Addr);
+        {error, _}          -> false
+    end;
+%% We could parse the results of inet:getifaddrs() instead. But that
+%% would be more complex and less maybe Windows-compatible...
+is_loopback({127,_,_,_})             -> true;
+is_loopback({0,0,0,0,0,0,0,1})       -> true;
+is_loopback({0,0,0,0,0,65535,AB,CD}) -> is_loopback(ipv4(AB, CD));
+is_loopback(_)                       -> false.
+
+ipv4(AB, CD) -> {AB bsr 8, AB band 255, CD bsr 8, CD band 255}.

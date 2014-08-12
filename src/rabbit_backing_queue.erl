@@ -10,15 +10,13 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2007-2012 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2014 GoPivotal, Inc.  All rights reserved.
 %%
 
 -module(rabbit_backing_queue).
 
 -ifdef(use_specs).
-
--export_type([async_callback/0]).
 
 %% We can't specify a per-queue ack/state with callback signatures
 -type(ack()   :: any()).
@@ -26,24 +24,27 @@
 
 -type(msg_ids() :: [rabbit_types:msg_id()]).
 -type(fetch_result(Ack) ::
-        ('empty' |
-         %% Message,                  IsDelivered, AckTag, Remaining_Len
-         {rabbit_types:basic_message(), boolean(), Ack, non_neg_integer()})).
--type(attempt_recovery() :: boolean()).
+        ('empty' | {rabbit_types:basic_message(), boolean(), Ack})).
+-type(drop_result(Ack) ::
+        ('empty' | {rabbit_types:msg_id(), Ack})).
+-type(recovery_terms() :: [term()] | 'non_clean_shutdown').
+-type(recovery_info() :: 'new' | recovery_terms()).
 -type(purged_msg_count() :: non_neg_integer()).
 -type(async_callback() ::
         fun ((atom(), fun ((atom(), state()) -> state())) -> 'ok')).
 -type(duration() :: ('undefined' | 'infinity' | number())).
 
--type(msg_fun() :: fun((rabbit_types:basic_message(), ack()) -> 'ok') |
-                   'undefined').
+-type(msg_fun(A) :: fun ((rabbit_types:basic_message(), ack(), A) -> A)).
 -type(msg_pred() :: fun ((rabbit_types:message_properties()) -> boolean())).
 
 %% Called on startup with a list of durable queue names. The queues
 %% aren't being started at this point, but this call allows the
 %% backing queue to perform any checking necessary for the consistency
 %% of those queues, or initialise any other shared resources.
--callback start([rabbit_amqqueue:name()]) -> 'ok'.
+%%
+%% The list of queue recovery terms returned as {ok, Terms} must be given
+%% in the same order as the list of queue names supplied.
+-callback start([rabbit_amqqueue:name()]) -> rabbit_types:ok(recovery_terms()).
 
 %% Called to tear down any state/resources. NB: Implementations should
 %% not depend on this function being called on shutdown and instead
@@ -54,15 +55,17 @@
 %%
 %% Takes
 %% 1. the amqqueue record
-%% 2. a boolean indicating whether the queue is an existing queue that
-%%    should be recovered
+%% 2. a term indicating whether the queue is an existing queue that
+%%    should be recovered or not. When 'new' is given, no recovery is
+%%    taking place, otherwise a list of recovery terms is given, or
+%%    the atom 'non_clean_shutdown' if no recovery terms are available.
 %% 3. an asynchronous callback which accepts a function of type
 %%    backing-queue-state to backing-queue-state. This callback
 %%    function can be safely invoked from any process, which makes it
 %%    useful for passing messages back into the backing queue,
 %%    especially as the backing queue does not have control of its own
 %%    mailbox.
--callback init(rabbit_types:amqqueue(), attempt_recovery(),
+-callback init(rabbit_types:amqqueue(), recovery_info(),
                async_callback()) -> state().
 
 %% Called on queue shutdown when queue isn't being deleted.
@@ -72,14 +75,18 @@
 %% content.
 -callback delete_and_terminate(any(), state()) -> state().
 
-%% Remove all messages in the queue, but not messages which have been
-%% fetched and are pending acks.
+%% Remove all 'fetchable' messages from the queue, i.e. all messages
+%% except those that have been fetched already and are pending acks.
 -callback purge(state()) -> {purged_msg_count(), state()}.
+
+%% Remove all messages in the queue which have been fetched and are
+%% pending acks.
+-callback purge_acks(state()) -> state().
 
 %% Publish a message.
 -callback publish(rabbit_types:basic_message(),
-                  rabbit_types:message_properties(), pid(), state()) ->
-    state().
+                  rabbit_types:message_properties(), boolean(), pid(),
+                  state()) -> state().
 
 %% Called for messages which have already been passed straight
 %% out to a client. The queue will be empty for these calls
@@ -89,10 +96,7 @@
                            -> {ack(), state()}.
 
 %% Called to inform the BQ about messages which have reached the
-%% queue, but are not going to be further passed to BQ for some
-%% reason. Note that this may be invoked for messages for which
-%% BQ:is_duplicate/2 has already returned {'published' | 'discarded',
-%% BQS}.
+%% queue, but are not going to be further passed to BQ.
 -callback discard(rabbit_types:msg_id(), pid(), state()) -> state().
 
 %% Return ids of messages which have been confirmed since the last
@@ -124,32 +128,49 @@
 %% be ignored.
 -callback drain_confirmed(state()) -> {msg_ids(), state()}.
 
-%% Drop messages from the head of the queue while the supplied predicate returns
-%% true. Also accepts a boolean parameter that determines whether the messages
-%% necessitate an ack or not. If they do, the function returns a list of
-%% messages with the respective acktags.
--callback dropwhile(msg_pred(), true, state())
-                   -> {rabbit_types:message_properties() | undefined,
-                       [{rabbit_types:basic_message(), ack()}], state()};
-                   (msg_pred(), false, state())
-                   -> {rabbit_types:message_properties() | undefined,
-                       undefined, state()}.
+%% Drop messages from the head of the queue while the supplied
+%% predicate on message properties returns true. Returns the first
+%% message properties for which the predictate returned false, or
+%% 'undefined' if the whole backing queue was traversed w/o the
+%% predicate ever returning false.
+-callback dropwhile(msg_pred(), state())
+                   -> {rabbit_types:message_properties() | undefined, state()}.
+
+%% Like dropwhile, except messages are fetched in "require
+%% acknowledgement" mode and are passed, together with their ack tag,
+%% to the supplied function. The function is also fed an
+%% accumulator. The result of fetchwhile is as for dropwhile plus the
+%% accumulator.
+-callback fetchwhile(msg_pred(), msg_fun(A), A, state())
+                     -> {rabbit_types:message_properties() | undefined,
+                         A, state()}.
 
 %% Produce the next message.
 -callback fetch(true,  state()) -> {fetch_result(ack()), state()};
                (false, state()) -> {fetch_result(undefined), state()}.
 
+%% Remove the next message.
+-callback drop(true,  state()) -> {drop_result(ack()), state()};
+              (false, state()) -> {drop_result(undefined), state()}.
+
 %% Acktags supplied are for messages which can now be forgotten
 %% about. Must return 1 msg_id per Ack, in the same order as Acks.
 -callback ack([ack()], state()) -> {msg_ids(), state()}.
 
-%% Acktags supplied are for messages which should be processed. The
-%% provided callback function is called with each message.
--callback fold(msg_fun(), state(), [ack()]) -> state().
-
 %% Reinsert messages into the queue which have already been delivered
 %% and were pending acknowledgement.
 -callback requeue([ack()], state()) -> {msg_ids(), state()}.
+
+%% Fold over messages by ack tag. The supplied function is called with
+%% each message, its ack tag, and an accumulator.
+-callback ackfold(msg_fun(A), A, state(), [ack()]) -> {A, state()}.
+
+%% Fold over all the messages in a queue and return the accumulated
+%% results, leaving the queue undisturbed.
+-callback fold(fun((rabbit_types:basic_message(),
+                    rabbit_types:message_properties(),
+                    boolean(), A) -> {('stop' | 'cont'), A}),
+               A, state()) -> {A, state()}.
 
 %% How long is my queue?
 -callback len(state()) -> non_neg_integer().
@@ -188,6 +209,13 @@
 %% Called immediately before the queue hibernates.
 -callback handle_pre_hibernate(state()) -> state().
 
+%% Called when more credit has become available for credit_flow.
+-callback resume(state()) -> state().
+
+%% Used to help prioritisation in rabbit_amqqueue_process. The rate of
+%% inbound messages and outbound messages at the moment.
+-callback msg_rates(state()) -> {float(), float()}.
+
 %% Exists for debugging purposes, to be able to expose state via
 %% rabbitmqctl list_queues backing_queue_status
 -callback status(state()) -> [{atom(), any()}].
@@ -198,11 +226,10 @@
 -callback invoke(atom(), fun ((atom(), A) -> A), state()) -> state().
 
 %% Called prior to a publish or publish_delivered call. Allows the BQ
-%% to signal that it's already seen this message (and in what capacity
-%% - i.e. was it published previously or discarded previously) and
-%% thus the message should be dropped.
+%% to signal that it's already seen this message, (e.g. it was published
+%% or discarded previously) and thus the message should be dropped.
 -callback is_duplicate(rabbit_types:basic_message(), state())
-                      -> {'false'|'published'|'discarded', state()}.
+                      -> {boolean(), state()}.
 
 -else.
 
@@ -210,12 +237,14 @@
 
 behaviour_info(callbacks) ->
     [{start, 1}, {stop, 0}, {init, 3}, {terminate, 2},
-     {delete_and_terminate, 2}, {purge, 1}, {publish, 4},
-     {publish_delivered, 4}, {discard, 3}, {drain_confirmed, 1}, {dropwhile, 3},
-     {fetch, 2}, {ack, 2}, {fold, 3}, {requeue, 2}, {len, 1},
+     {delete_and_terminate, 2}, {purge, 1}, {purge_acks, 1}, {publish, 5},
+     {publish_delivered, 4}, {discard, 3}, {drain_confirmed, 1},
+     {dropwhile, 2}, {fetchwhile, 4},
+     {fetch, 2}, {ack, 2}, {requeue, 2}, {ackfold, 4}, {fold, 3}, {len, 1},
      {is_empty, 1}, {depth, 1}, {set_ram_duration_target, 2},
      {ram_duration, 1}, {needs_timeout, 1}, {timeout, 1},
-     {handle_pre_hibernate, 1}, {status, 1}, {invoke, 3}, {is_duplicate, 2}] ;
+     {handle_pre_hibernate, 1}, {resume, 1}, {msg_rates, 1}, {status, 1},
+     {invoke, 3}, {is_duplicate, 2}] ;
 behaviour_info(_Other) ->
     undefined.
 
